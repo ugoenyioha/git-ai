@@ -1,0 +1,19 @@
+src/commands/checkpoint_agent/presets/opencode.rs
+  s_1c7db1be974e2e::t_42fbe5a2097bd0 137,208-209,214-261,264,375-405,418-457
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "da3df0f56ea7f1236fc86cdfdf80cc59957484af",
+  "prompts": {},
+  "sessions": {
+    "s_1c7db1be974e2e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "s_1c7db1be974e2e",
+        "model": "unknown"
+      },
+      "human_author": "Claude <claude@anthropic.com>"
+    }
+  }
+}
