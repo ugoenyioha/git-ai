@@ -134,7 +134,7 @@ impl OpenCodePreset {
         };
 
         // Try sqlite first
-        let db_path = Self::resolve_sqlite_db_path(&opencode_path);
+        let db_path = Self::resolve_sqlite_db_path(&opencode_path, session_id);
         if let Some(db_path) = db_path {
             let parent_id = Self::lookup_parent_session(&db_path, session_id);
             return Some((
@@ -205,36 +205,63 @@ impl OpenCodePreset {
         }
     }
 
-    fn resolve_sqlite_db_path(path: &Path) -> Option<PathBuf> {
-        if path.is_file() {
-            return path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .filter(|name| *name == "opencode.db")
-                .map(|_| path.to_path_buf());
-        }
-
-        if !path.is_dir() {
-            return None;
-        }
-
-        let direct_db = path.join("opencode.db");
-        if direct_db.exists() {
-            return Some(direct_db);
-        }
-
-        if path
+    fn resolve_sqlite_db_path(path: &Path, session_id: &str) -> Option<PathBuf> {
+        let directory = if path
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name == "storage")
         {
-            let sibling_db = path.parent()?.join("opencode.db");
-            if sibling_db.exists() {
-                return Some(sibling_db);
+            path.parent()?
+        } else {
+            path
+        };
+        let candidates = if path.is_file() {
+            vec![path.to_path_buf()]
+        } else {
+            std::fs::read_dir(directory)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect()
+        };
+        let mut matched = None;
+        for candidate in candidates {
+            let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name != "opencode.db" && !(name.starts_with("opencode-") && name.ends_with(".db")) {
+                continue;
+            }
+            let metadata = candidate.metadata().ok()?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                continue;
+            }
+            let conn = crate::streams::agents::opencode::open_sqlite_readonly(&candidate).ok()?;
+            conn.busy_timeout(std::time::Duration::from_millis(50))
+                .ok()?;
+            let has_sessions: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session')",
+                [], |row| row.get(0),
+            ).ok()?;
+            if !has_sessions {
+                continue;
+            }
+            let found: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session WHERE id = ?)",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .ok()?;
+            if found {
+                // Copied sessions are ambiguous: do not attach a potentially stale transcript.
+                if matched.is_some() {
+                    return None;
+                }
+                matched = Some(candidate);
             }
         }
-
-        None
+        matched
     }
 }
 
@@ -345,6 +372,37 @@ mod tests {
     use crate::commands::checkpoint_agent::presets::*;
     use serde_json::json;
 
+    #[test]
+    fn resolves_channel_database_by_session_not_filename_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, session) in [("opencode.db", "old"), ("opencode-dev.db", "current")] {
+            let conn = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+            conn.execute_batch("CREATE TABLE session (id TEXT PRIMARY KEY);")
+                .unwrap();
+            conn.execute("INSERT INTO session (id) VALUES (?)", [session])
+                .unwrap();
+        }
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(dir.path(), "current"),
+            Some(dir.path().join("opencode-dev.db"))
+        );
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(dir.path(), "missing"),
+            None
+        );
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(&dir.path().join("opencode-dev.db"), "current"),
+            Some(dir.path().join("opencode-dev.db"))
+        );
+        let conn = rusqlite::Connection::open(dir.path().join("opencode.db")).unwrap();
+        conn.execute("INSERT INTO session (id) VALUES (?)", ["current"])
+            .unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(dir.path(), "current"),
+            None
+        );
+    }
+
     fn make_opencode_input(event: &str, tool: &str) -> String {
         json!({
             "hook_event_name": event,
@@ -355,6 +413,46 @@ mod tests {
             "tool_input": {"file_path": "src/main.rs"}
         })
         .to_string()
+    }
+
+    #[test]
+    fn unreadable_channel_prevents_stale_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY); INSERT INTO session VALUES ('copied');",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("opencode-dev.db"), "not a sqlite database").unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(dir.path(), "copied"),
+            None
+        );
+    }
+
+    #[test]
+    fn empty_and_non_session_databases_do_not_hide_valid_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode-dev.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY); INSERT INTO session VALUES ('current');",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("opencode-empty.db"), "").unwrap();
+        let auxiliary = rusqlite::Connection::open(dir.path().join("opencode-cache.db")).unwrap();
+        auxiliary
+            .execute_batch("CREATE TABLE cache (id TEXT);")
+            .unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(dir.path(), "current"),
+            Some(db.clone())
+        );
+        std::fs::create_dir(dir.path().join("storage")).unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_sqlite_db_path(&dir.path().join("storage"), "current"),
+            Some(db)
+        );
     }
 
     #[test]
