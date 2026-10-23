@@ -1,0 +1,19 @@
+src/streams/model_extraction.rs
+  s_befd3a671b0351::t_247b67e3ef0c6e 1026-1060,1498-1553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b6ce91344f6f9fdf0f87305d125ded909830ae90",
+  "prompts": {},
+  "sessions": {
+    "s_befd3a671b0351": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ecdacc52effegjm25KJmnD8MwB",
+        "model": "anthropic/claude-sonnet-5-5"
+      },
+      "human_author": "Claude <claude@anthropic.com>"
+    }
+  }
+}
