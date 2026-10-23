@@ -126,12 +126,16 @@ impl OpenCodePreset {
         Some(joined.to_string_lossy().replace('\\', "/"))
     }
 
-    fn resolve_stream_source(session_id: &str) -> Option<(StreamSource, PathBuf)> {
-        let opencode_path = if let Ok(test_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
-            PathBuf::from(test_path)
+    fn storage_base() -> Option<PathBuf> {
+        if let Ok(test_path) = std::env::var("GIT_AI_OPENCODE_STORAGE_PATH") {
+            Some(PathBuf::from(test_path))
         } else {
-            Self::opencode_data_path().ok()?
-        };
+            Self::opencode_data_path().ok()
+        }
+    }
+
+    fn resolve_stream_source(session_id: &str) -> Option<(StreamSource, PathBuf)> {
+        let opencode_path = Self::storage_base()?;
 
         // Try sqlite first
         let db_path = Self::resolve_sqlite_db_path(&opencode_path, session_id);
@@ -263,6 +267,104 @@ impl OpenCodePreset {
         }
         matched
     }
+
+    /// OpenCode V2 keeps sessions in `session_v2` and messages in `session_message`; it has no `session` or
+    /// `message` table, so the V1 resolver skips such a database. The model that served a session is the
+    /// `model.id` of its most recent assistant row. Only that id is read (`json_extract`), never message text,
+    /// and the database is opened read-only. `known_db` is a database the V1 resolver already matched by
+    /// session id (a database holding both table sets); otherwise every `opencode.db` / `opencode-*.db` in
+    /// `base` is checked, and a session found in more than one of them, or an unreadable candidate, yields
+    /// no model rather than a guess (the same rule the V1 resolver applies).
+    fn resolve_v2_model(base: &Path, session_id: &str, known_db: Option<&Path>) -> Option<String> {
+        const MODEL_QUERY: &str = "SELECT json_extract(data, '$.model.id') FROM session_message \
+             WHERE session_id = ? AND type = 'assistant' AND json_extract(data, '$.model.id') IS NOT NULL \
+             ORDER BY seq DESC LIMIT 1";
+        let query_one = |db: &Path| -> Result<Option<String>, ()> {
+            let conn = crate::streams::agents::opencode::open_sqlite_readonly(db).map_err(|_| ())?;
+            conn.busy_timeout(std::time::Duration::from_millis(50))
+                .map_err(|_| ())?;
+            let has_v2: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'session_message')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| ())?;
+            if !has_v2 {
+                return Ok(None);
+            }
+            let model = rusqlite::OptionalExtension::optional(conn.query_row(
+                MODEL_QUERY,
+                [session_id],
+                |row| row.get::<_, Option<String>>(0),
+            ))
+            .map_err(|_| ())?
+            .flatten();
+            Ok(model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty()))
+        };
+
+        if let Some(db) = known_db {
+            return query_one(db).ok().flatten();
+        }
+
+        let directory = if base
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "storage")
+        {
+            base.parent()?
+        } else {
+            base
+        };
+        let candidates: Vec<PathBuf> = if base.is_file() {
+            vec![base.to_path_buf()]
+        } else {
+            std::fs::read_dir(directory)
+                .ok()?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .collect()
+        };
+        let mut found: Option<String> = None;
+        let mut hits = 0;
+        for candidate in candidates {
+            let Some(name) = candidate.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if name != "opencode.db" && !(name.starts_with("opencode-") && name.ends_with(".db")) {
+                continue;
+            }
+            let Ok(metadata) = candidate.metadata() else {
+                return None;
+            };
+            if !metadata.is_file() || metadata.len() == 0 {
+                continue;
+            }
+            match query_one(&candidate) {
+                Err(()) => return None,
+                Ok(None) => {}
+                Ok(Some(model)) => {
+                    hits += 1;
+                    found = Some(model);
+                }
+            }
+        }
+        if hits == 1 { found } else { None }
+    }
+
+    /// V1 first (unchanged), then V2. `v1_db` is the database the V1 resolver matched, if any.
+    fn lookup_model(session_id: &str, v1_db: Option<&Path>, base: Option<&Path>) -> Option<String> {
+        let v1 = v1_db.and_then(|db| {
+            crate::streams::model_extraction::extract_model(
+                db,
+                crate::streams::sweep::StreamFormat::OpenCodeSqlite,
+                Some(session_id),
+            )
+            .ok()
+            .flatten()
+        });
+        v1.or_else(|| Self::resolve_v2_model(base?, session_id, v1_db))
+    }
 }
 
 impl AgentPreset for OpenCodePreset {
@@ -311,15 +413,12 @@ impl AgentPreset for OpenCodePreset {
         // Resolve transcript source
         let transcript_result = Self::resolve_stream_source(&session_id);
 
-        let extracted_model = transcript_result.as_ref().and_then(|(ts, _)| {
-            crate::streams::model_extraction::extract_model(
-                &ts.path,
-                crate::streams::sweep::StreamFormat::OpenCodeSqlite,
-                Some(session_id.as_str()),
-            )
-            .ok()
-            .flatten()
-        });
+        let storage_base = Self::storage_base();
+        let extracted_model = Self::lookup_model(
+            &session_id,
+            transcript_result.as_ref().map(|(ts, _)| ts.path.as_path()),
+            storage_base.as_deref(),
+        );
 
         let context = PresetContext {
             agent_id: AgentId {
@@ -401,6 +500,172 @@ mod tests {
             OpenCodePreset::resolve_sqlite_db_path(dir.path(), "current"),
             None
         );
+    }
+
+    fn v2_db(dir: &Path, name: &str, rows: &[(&str, &str, i64, &str)]) -> PathBuf {
+        // rows: (session_id, type, seq, data json)
+        let path = dir.join(name);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, model TEXT);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);",
+        )
+        .unwrap();
+        for (i, (sid, kind, seq, data)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_message VALUES (?, ?, ?, ?, 0, 0, ?)",
+                rusqlite::params![format!("m{i}"), sid, kind, seq, data],
+            )
+            .unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn v2_model_is_the_latest_assistant_row() {
+        let dir = tempfile::tempdir().unwrap();
+        v2_db(
+            dir.path(),
+            "opencode-v2.db",
+            &[
+                ("ses_a", "user", 1, r#"{"text":"SECRET PROMPT"}"#),
+                ("ses_a", "assistant", 2, r#"{"model":{"id":"anthropic/claude-sonnet-5-5","providerID":"homelab"}}"#),
+                ("ses_a", "assistant", 5, r#"{"model":{"id":"antigravity/antigravity-gemini-4-argon","providerID":"homelab"}}"#),
+                ("ses_a", "user", 9, r#"{"model":{"id":"later-user-row-model"}}"#),
+                ("ses_b", "assistant", 1, r#"{"model":{"id":"openai/gpt-5.6-sol","providerID":"homelab"}}"#),
+            ],
+        );
+        assert_eq!(
+            OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None).as_deref(),
+            Some("antigravity/antigravity-gemini-4-argon")
+        );
+        assert_eq!(
+            OpenCodePreset::resolve_v2_model(dir.path(), "ses_b", None).as_deref(),
+            Some("openai/gpt-5.6-sol")
+        );
+    }
+
+    #[test]
+    fn v2_session_without_assistant_row_or_unknown_session_gives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        v2_db(
+            dir.path(),
+            "opencode-v2.db",
+            &[
+                ("ses_user_only", "user", 1, r#"{"text":"hi","model":{"id":"user-row-model"}}"#),
+                ("ses_nomodel", "assistant", 1, r#"{"model":{}}"#),
+                ("ses_blank", "assistant", 1, r#"{"model":{"id":"  "}}"#),
+            ],
+        );
+        for sid in ["ses_user_only", "ses_nomodel", "ses_blank", "ses_missing"] {
+            assert_eq!(OpenCodePreset::resolve_v2_model(dir.path(), sid, None), None, "{sid}");
+        }
+    }
+
+    #[test]
+    fn v2_lookup_on_empty_absent_or_non_sqlite_storage_is_none_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None), None);
+        assert_eq!(
+            OpenCodePreset::resolve_v2_model(&dir.path().join("does-not-exist"), "ses_a", None),
+            None
+        );
+        std::fs::write(dir.path().join("opencode-empty.db"), "").unwrap();
+        assert_eq!(OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None), None);
+        std::fs::write(dir.path().join("opencode-bad.db"), "not a sqlite database").unwrap();
+        // an unreadable candidate must not let a different database win by default
+        v2_db(
+            dir.path(),
+            "opencode-v2.db",
+            &[("ses_a", "assistant", 1, r#"{"model":{"id":"anthropic/x"}}"#)],
+        );
+        assert_eq!(OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None), None);
+    }
+
+    #[test]
+    fn v2_session_present_in_two_databases_gives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = [("ses_a", "assistant", 1, r#"{"model":{"id":"anthropic/x"}}"#)];
+        v2_db(dir.path(), "opencode.db", &row);
+        v2_db(dir.path(), "opencode-v2.db", &row);
+        assert_eq!(OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None), None);
+    }
+
+    #[test]
+    fn v2_lookup_ignores_v1_only_and_unrelated_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = rusqlite::Connection::open(dir.path().join("opencode-dev.db")).unwrap();
+        v1.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES ('ses_a');",
+        )
+        .unwrap();
+        v2_db(
+            dir.path(),
+            "opencode-v2.db",
+            &[("ses_a", "assistant", 1, r#"{"model":{"id":"anthropic/claude-sonnet-5-5"}}"#)],
+        );
+        let other = rusqlite::Connection::open(dir.path().join("opencode-cache.db")).unwrap();
+        other.execute_batch("CREATE TABLE cache (id TEXT);").unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None).as_deref(),
+            Some("anthropic/claude-sonnet-5-5")
+        );
+    }
+
+    #[test]
+    fn v1_model_is_unchanged_and_wins_over_v2() {
+        // V1-shaped database: the V1 table is used exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("opencode-dev.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES ('ses_v1');
+             INSERT INTO message VALUES ('m1', 'ses_v1', 1, 1, '{\"role\":\"assistant\",\"modelID\":\"claude-opus-4-6\",\"providerID\":\"anthropic\"}');",
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            OpenCodePreset::lookup_model("ses_v1", Some(&db), Some(dir.path())).as_deref(),
+            Some("claude-opus-4-6")
+        );
+        // A database holding both table sets: V1 row present, so V1 answers; V2 is only the fallback.
+        let both = dir.path().join("opencode.db");
+        let c = rusqlite::Connection::open(&both).unwrap();
+        c.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT);
+             INSERT INTO session VALUES ('ses_both'), ('ses_only_v2');
+             INSERT INTO message VALUES ('m1', 'ses_both', 1, 1, '{\"role\":\"assistant\",\"modelID\":\"gpt-5\"}');
+             INSERT INTO session_message VALUES ('s1', 'ses_both', 'assistant', 1, 0, 0, '{\"model\":{\"id\":\"v2-model\"}}');
+             INSERT INTO session_message VALUES ('s2', 'ses_only_v2', 'assistant', 1, 0, 0, '{\"model\":{\"id\":\"v2-model\"}}');",
+        )
+        .unwrap();
+        drop(c);
+        assert_eq!(OpenCodePreset::lookup_model("ses_both", Some(&both), Some(dir.path())).as_deref(), Some("gpt-5"));
+        assert_eq!(
+            OpenCodePreset::lookup_model("ses_only_v2", Some(&both), Some(dir.path())).as_deref(),
+            Some("v2-model")
+        );
+    }
+
+    #[test]
+    fn v2_database_is_opened_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = v2_db(
+            dir.path(),
+            "opencode-v2.db",
+            &[("ses_a", "assistant", 1, r#"{"model":{"id":"anthropic/x"}}"#)],
+        );
+        let before = std::fs::read(&db).unwrap();
+        assert_eq!(
+            OpenCodePreset::resolve_v2_model(dir.path(), "ses_a", None).as_deref(),
+            Some("anthropic/x")
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), before, "the lookup must not modify the database");
     }
 
     fn make_opencode_input(event: &str, tool: &str) -> String {
