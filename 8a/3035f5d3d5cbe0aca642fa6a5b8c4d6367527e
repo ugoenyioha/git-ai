@@ -1,0 +1,24 @@
+src/daemon.rs
+  s_befd3a671b0351::t_518f6d834181ad 10768
+  s_befd3a671b0351::t_2e5362773a66b7 10094-10105,10107-10123
+  s_befd3a671b0351::t_edd07c15a0b23c 11915-11981
+  s_befd3a671b0351::t_60df4d0547e64c 10106,11982-11999
+src/git/sync_authorship.rs
+  s_befd3a671b0351::t_55b0c79450d1d8 496-506,512,525,671-699
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8a3035f5d3d5cbe0aca642fa6a5b8c4d6367527e",
+  "prompts": {},
+  "sessions": {
+    "s_befd3a671b0351": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ecdacc52effegjm25KJmnD8MwB",
+        "model": "anthropic/claude-sonnet-5-5"
+      },
+      "human_author": "Claude <claude@anthropic.com>"
+    }
+  }
+}
